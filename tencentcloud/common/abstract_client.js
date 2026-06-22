@@ -5,6 +5,7 @@ const Sign = require("./sign");
 const HttpConnection = require("./http/http_connection");
 const TencentCloudSDKHttpException = require("./exception/tencent_cloud_sdk_exception");
 const SSEResponseModel = require("./sse_response_model");
+const { EndpointFailover } = require("./endpoint_failover");
 const uuidv4 = require("uuid").v4;
 
 /**
@@ -43,6 +44,14 @@ class AbstractClient {
          * @type {ClientProfile}
          */
         this.profile = profile || new ClientProfile();
+
+        /**
+         * Per-client domain failover handler, or null when disabled.
+         */
+        this.endpointFailover =
+            this.profile.httpProfile.domainFailover !== false
+                ? new EndpointFailover({ backupEndpoint: this.profile.backupEndpoint })
+                : null;
     }
 
     /**
@@ -111,7 +120,6 @@ class AbstractClient {
      */
     async doRequest(action, req, options) {
         let params = this.mergeData(req);
-        params = this.formatRequestData(action, params);
 
         const headers = Object.assign(
             {},
@@ -130,19 +138,34 @@ class AbstractClient {
             headers["X-TC-TraceId"] = traceId
         }
 
-        let res;
-        try {
-            res = await HttpConnection.doRequest({
+        // Re-sign per endpoint: signature is bound to the host.
+        const doFetch = async (endpoint) => {
+            const signedParams = this.formatRequestData(action, Object.assign({}, params), endpoint);
+            return HttpConnection.doRequest({
                 method: this.profile.httpProfile.reqMethod,
-                url: this.profile.httpProfile.protocol + this.getEndpoint() + this.path,
-                data: params,
+                url: this.profile.httpProfile.protocol + endpoint + this.path,
+                data: signedParams,
                 timeout: this.profile.httpProfile.reqTimeout * 1000,
                 headers,
             });
+        };
+
+        try {
+            if (this.endpointFailover) {
+                return await this.endpointFailover.execute(
+                    this.getEndpoint(),
+                    doFetch,
+                    (r) => this.parseResponse(r)
+                );
+            }
+            const res = await doFetch(this.getEndpoint());
+            return await this.parseResponse(res);
         } catch (error) {
+            if (error instanceof TencentCloudSDKHttpException) {
+                throw error;
+            }
             throw new TencentCloudSDKHttpException(error.message, "", traceId);
         }
-        return await this.parseResponse(res)
     }
 
     /**
@@ -166,16 +189,15 @@ class AbstractClient {
             headers["X-TC-TraceId"] = traceId
         }
 
-        let res;
-        try {
-            res = await HttpConnection.doRequestWithSign3({
+        const doFetch = async (endpoint) => {
+            return HttpConnection.doRequestWithSign3({
                 method: this.profile.httpProfile.reqMethod,
-                url: this.profile.httpProfile.protocol + this.getEndpoint() + this.path,
+                url: this.profile.httpProfile.protocol + endpoint + this.path,
                 secretId: this.credential.secretId,
                 secretKey: this.credential.secretKey,
                 region: this.region,
                 data: params,
-                service: this.getEndpoint().split('.')[0],
+                service: endpoint.split('.')[0],
                 action: action,
                 version: this.apiVersion,
                 multipart: options.multipart,
@@ -183,11 +205,25 @@ class AbstractClient {
                 token: this.credential.token,
                 requestClient: this.sdkVersion,
                 headers,
-            })
+            });
+        };
+
+        try {
+            if (this.endpointFailover) {
+                return await this.endpointFailover.execute(
+                    this.getEndpoint(),
+                    doFetch,
+                    (r) => this.parseResponse(r)
+                );
+            }
+            const res = await doFetch(this.getEndpoint());
+            return await this.parseResponse(res);
         } catch (e) {
-            throw new TencentCloudSDKHttpException(e.message, "", traceId)
+            if (e instanceof TencentCloudSDKHttpException) {
+                throw e;
+            }
+            throw new TencentCloudSDKHttpException(e.message, "", traceId);
         }
-        return await this.parseResponse(res)
     }
 
     async parseResponse(res) {
@@ -195,12 +231,25 @@ class AbstractClient {
         if (res.status !== 200) {
             const tcError = new TencentCloudSDKHttpException(res.statusText, "", traceId)
             tcError.httpCode = res.status
+            tcError.failover = true
             throw tcError;
         } else {
             if (res.headers.get("content-type") === "text/event-stream") {
                 return new SSEResponseModel(res.body)
             } else {
-                const data = await res.json();
+                let data;
+                try {
+                    data = await res.json();
+                } catch (e) {
+                    const tcError = new TencentCloudSDKHttpException(e.message, "", traceId)
+                    tcError.failover = true
+                    throw tcError;
+                }
+                if (!data || !data.Response || !data.Response.RequestId) {
+                    const tcError = new TencentCloudSDKHttpException("unexpected response", "", traceId)
+                    tcError.failover = true
+                    throw tcError;
+                }
                 if (data.Response.Error) {
                     const tcError = new TencentCloudSDKHttpException(data.Response.Error.Message, data.Response.RequestId, traceId)
                     tcError.code = data.Response.Error.Code
@@ -233,7 +282,7 @@ class AbstractClient {
     /**
      * @inner
      */
-    formatRequestData(action, params) {
+    formatRequestData(action, params, endpoint) {
         params.Action = action;
         params.RequestClient = this.sdkVersion;
         params.Nonce= Math.round(Math.random() * 65535);
@@ -256,7 +305,7 @@ class AbstractClient {
         if (this.profile.signMethod) {
             params.SignatureMethod = this.profile.signMethod;
         }
-        let signStr = this.formatSignString(params);
+        let signStr = this.formatSignString(params, endpoint);
 
         params.Signature = Sign.sign(this.credential.secretKey, signStr, this.profile.signMethod);
         return params;
@@ -265,7 +314,7 @@ class AbstractClient {
     /**
      * @inner
      */
-    formatSignString (params) {
+    formatSignString (params, endpoint) {
         let strParam = "";
         let keys = Object.keys(params);
         keys.sort();
@@ -273,7 +322,8 @@ class AbstractClient {
             //k = k.replace(/_/g, '.');
             strParam += ("&" + keys[k] + "=" + params[keys[k]]);
         }
-        let strSign = this.profile.httpProfile.reqMethod.toLocaleUpperCase() + this.getEndpoint() +
+        const host = endpoint || this.getEndpoint();
+        let strSign = this.profile.httpProfile.reqMethod.toLocaleUpperCase() + host +
             this.path + "?" + strParam.slice(1);
         return strSign;
     }

@@ -9,8 +9,9 @@ class ClientProfile {
     /**
      * @param {string} signMethod Signature method, valid values: HmacSHA1, HmacSHA256.
      * @param {HttpProfile} httpProfile HTTP settings.
+     * @param {string} backupEndpoint Backup endpoint host used by domain failover.
      */
-    constructor(signMethod, httpProfile) {
+    constructor(signMethod, httpProfile, backupEndpoint) {
         /**
          * @type {string}
          */
@@ -20,6 +21,14 @@ class ClientProfile {
          * @type {httpProfile}
          */
         this.httpProfile = httpProfile || new HttpProfile();
+
+        /**
+         * Backup endpoint for domain failover. When set, failed requests fall back
+         * to "<service>.<backupEndpoint>" (or backupEndpoint verbatim if it already
+         * starts with the service prefix).
+         * @type {string || null}
+         */
+        this.backupEndpoint = backupEndpoint || null;
     }
 }
 module.exports = ClientProfile

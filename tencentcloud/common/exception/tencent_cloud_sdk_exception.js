@@ -6,6 +6,8 @@ class TencentCloudSDKHttpException extends Error {
         super(error);
         this.requestId = requestId || '';
         this.traceId = traceId || '';
+        // Whether the error is eligible to trigger domain failover.
+        this.failover = false;
     }
 
     getMessage() {
