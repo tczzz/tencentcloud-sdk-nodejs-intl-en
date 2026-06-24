@@ -8,8 +8,8 @@ const { CircuitBreaker } = require("./circuit_breaker")
  */
 const KNOWN_API_SUFFIXES = [
   "tencentcloudapi.com",
-  "tencentcloudapi.cn",
   "tencentcloudapi.com.cn",
+  "tencentcloudapi.cn",
 ]
 
 /** Prefixes that identify a regional label (e.g. "ap-shanghai"). */
