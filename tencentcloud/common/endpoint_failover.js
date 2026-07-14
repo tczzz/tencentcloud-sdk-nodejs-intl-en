@@ -3,17 +3,15 @@ const FetchError = nodeFetch.FetchError
 const { CircuitBreaker } = require("./circuit_breaker")
 
 /**
- * Known Tencent Cloud API endpoint suffixes. Failover rotates among these while
- * preserving the host prefix (including family labels like "ai") verbatim.
+ * Known Tencent Cloud API endpoint suffixes. Failover rotates among these,
+ * keeping just the service label (e.g. "cvm"), or the full "<service>.ai" /
+ * "<service>.internal" label verbatim for those two families.
  */
 const KNOWN_API_SUFFIXES = [
   "tencentcloudapi.com",
   "tencentcloudapi.com.cn",
   "tencentcloudapi.cn",
 ]
-
-/** Prefixes that identify a regional label (e.g. "ap-shanghai"). */
-const REGION_PREFIXES = ["ap-", "na-", "eu-", "sa-", "af-", "me-"]
 
 /** Breaker Open -> HalfOpen timeout (ms). */
 const BREAKER_TIMEOUT_MS = 60 * 1000
@@ -57,10 +55,9 @@ class FailoverState {
 
 /**
  * Domain failover for Tencent Cloud API calls. Two modes share one pipeline:
- * backupEndpoint fallback, or suffix rotation (.com / .cn / .com.cn) preserving
- * the host prefix. Region-pinned hosts try the original host first, then
- * rotate over candidates with the region label stripped. Per-host
- * CircuitBreakers suppress repeated attempts; state is per AbstractClient instance.
+ * backupEndpoint fallback, or suffix rotation (.com / .cn / .com.cn) built
+ * from the service prefix. Per-host CircuitBreakers suppress repeated
+ * attempts; state is per AbstractClient instance.
  */
 class EndpointFailover {
   constructor(options) {
@@ -126,21 +123,9 @@ class EndpointFailover {
     if (!m) {
       return null
     }
-    // For region-pinned hosts, rotate over candidates with the region label stripped,
-    // while still trying the original host (region preserved) first.
-    if (m.hasRegion) {
-      const order = suffixTryOrder(m.suffixIdx)
-      const candidates = [{ host: endpoint }]
-      for (const s of order) {
-        const host = m.serviceWithoutRegion + "." + KNOWN_API_SUFFIXES[s]
-        if (host !== endpoint) {
-          candidates.push({ host })
-        }
-      }
-      return candidates
-    }
+
     return suffixTryOrder(m.suffixIdx).map(function (s) {
-      return { host: m.servicePrefix + "." + KNOWN_API_SUFFIXES[s] }
+      return { host: s === m.suffixIdx ? endpoint : m.servicePrefix + "." + KNOWN_API_SUFFIXES[s] }
     })
   }
 
@@ -188,7 +173,7 @@ class EndpointFailover {
   }
 
   /**
-   * Whether a host is a known Tencent Cloud API domain (region-pinned included).
+   * Whether a host is a known Tencent Cloud API domain.
    */
   static isKnownTencentCloudHost(host) {
     return suffixMatchOf(host) != null
@@ -203,8 +188,10 @@ class EndpointFailover {
 }
 
 /**
- * Recognise host = "<prefix>.<suffix>". The prefix is preserved verbatim; only a
- * regional label sets hasRegion. Returns null if no known suffix matches.
+ * Recognise host = "<prefix>.<suffix>". For the "ai." / "internal." families
+ * the prefix is kept verbatim (e.g. "hunyuan.ai"); otherwise only the leading
+ * service label is kept (e.g. "cvm" from "cvm.ap-guangzhou"). Returns null if
+ * no known suffix matches.
  */
 function suffixMatchOf(host) {
   if (!host) {
@@ -215,14 +202,10 @@ function suffixMatchOf(host) {
     return null
   }
   const prefix = host.substring(0, host.length - KNOWN_API_SUFFIXES[suffixIdx].length - 1)
-  const labels = prefix.split(".")
-  const hasRegion = labels.some(looksLikeRegionLabel)
-  const serviceWithoutRegion = hasRegion
-    ? labels.filter(function (l) {
-        return !looksLikeRegionLabel(l)
-      }).join(".")
-    : prefix
-  return { suffixIdx: suffixIdx, hasRegion: hasRegion, servicePrefix: prefix, serviceWithoutRegion: serviceWithoutRegion }
+  const isAiOrInternal = prefix.endsWith(".ai") || prefix.endsWith(".internal")
+  const dot = prefix.indexOf(".")
+  const servicePrefix = isAiOrInternal || dot < 0 ? prefix : prefix.substring(0, dot)
+  return { suffixIdx: suffixIdx, servicePrefix: servicePrefix }
 }
 
 /** Index of the longest KNOWN_API_SUFFIXES entry suffixing host, or -1. */
@@ -242,12 +225,6 @@ function matchSuffix(host) {
     bestLen = suffix.length
   }
   return best
-}
-
-function looksLikeRegionLabel(label) {
-  return !!label && REGION_PREFIXES.some(function (p) {
-    return label.startsWith(p)
-  })
 }
 
 function serviceOf(host) {
