@@ -237,19 +237,7 @@ class AbstractClient {
             if (res.headers.get("content-type") === "text/event-stream") {
                 return new SSEResponseModel(res.body)
             } else {
-                let data;
-                try {
-                    data = await res.json();
-                } catch (e) {
-                    const tcError = new TencentCloudSDKHttpException(e.message, "", traceId)
-                    tcError.failover = true
-                    throw tcError;
-                }
-                if (!data || !data.Response || !data.Response.RequestId) {
-                    const tcError = new TencentCloudSDKHttpException("unexpected response", "", traceId)
-                    tcError.failover = true
-                    throw tcError;
-                }
+                const data = await res.json();
                 if (data.Response.Error) {
                     const tcError = new TencentCloudSDKHttpException(data.Response.Error.Message, data.Response.RequestId, traceId)
                     tcError.code = data.Response.Error.Code
